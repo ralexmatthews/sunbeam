@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**SunBeam** is a small macOS SwiftUI menu app that sets the RGB lighting on a **Razer Basilisk V3 Pro** mouse (static color, spectrum, breathing, off, plus brightness). It talks to the mouse directly over IOKit HID — no kernel extension, no root, no OpenRazer daemon. The wire protocol was reverse-derived from the OpenRazer Linux driver.
+**SunBeam** is a small macOS SwiftUI single-window app that sets the RGB lighting on a **Razer Basilisk V3 Pro** mouse (static color, spectrum, breathing, off, plus brightness). It talks to the mouse directly over IOKit HID — no kernel extension, no root, no OpenRazer daemon. The wire protocol was reverse-derived from the OpenRazer Linux driver.
 
 ## Build & run
 
@@ -23,13 +23,14 @@ There is a single target and scheme (`SunBeam`), Debug/Release configurations, a
 
 ## Architecture
 
-Three files, layered so that UI, device I/O, and protocol are independently understandable:
+Four files, layered so that app shell, UI, device I/O, and protocol are independently understandable:
 
 - **`RazerProtocol.swift`** — pure data, no IOKit. `RazerReport` builds Razer's fixed **90-byte** feature-report packet (XOR checksum over bytes `2...87`, transaction id `0x1F`). Factory methods (`staticColor`, `spectrum`, `breathing`, `off`, `brightness`) encode the command arguments. `RazerIDs` and `RazerMode` also live here. Writes use `VARSTORE`, so the mouse persists the effect across quit/power-cycle.
 - **`RazerController.swift`** — two types:
   - `RazerController`: `@Observable` MainActor view-model SwiftUI binds to (`isConnected`, `statusText`, `lastError`). A thin republishing surface.
   - `RazerDeviceLink`: **all** IOKit work. Owns the `IOHIDManager`, opens every vendor control interface via device-added/removed callbacks on the main run loop, and sends reports on a background dispatch queue. It keeps the set of currently-present control interfaces (`controls`) and `updateActiveDevice()` derives the active `device` from it, preferring the wired interface — so the status re-checks on hot-plug (unplugging the cable falls back to the dongle without a relaunch).
 - **`ContentView.swift`** — the UI (effect picker, color picker + hex/RGB text field, brightness slider, Apply button) plus the `Color` ⇄ hex/`rgbBytes` helpers and the `Color.hex(fromUserInput:)` parser. State is `@AppStorage`-persisted so the window reopens with the last values. Edits are **staged only** — nothing is sent to the mouse until **Apply** is pressed; the app never re-applies on launch (the mouse already remembers via VARSTORE).
+- **`SunBeamApp.swift`** — the `@main` entry. Owns the single `RazerController` and configures the window: `.windowStyle(.hiddenTitleBar)` (no title bar or divider; the traffic-light buttons float over the content, which is why `ContentView` carries an extra top inset) and `.windowResizability(.contentSize)` (the window is exactly the content size). An `AppDelegate` returns `applicationShouldTerminateAfterLastWindowClosed == true`, so closing the single window quits the app.
 
 Data flow: `ContentView` edits stage `@AppStorage` values → **Apply** → `applyCurrent()` → `controller.apply(...)` → `link.apply(DesiredState)`.
 
