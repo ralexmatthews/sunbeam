@@ -31,7 +31,7 @@ open SunBeam.xcodeproj          # then press Cmd+R in Xcode
 xcodebuild -scheme SunBeam -configuration Debug build
 ```
 
-There is a single target and scheme (`SunBeam`), Debug/Release configurations, and no tests. When building for the first time you may need to select your own **Development Team** under *Signing & Capabilities* (the app uses a hardened runtime and is sandboxed with the USB device entitlement).
+There is a single target and scheme (`SunBeam`), Debug/Release configurations, and no tests. When building for the first time you may need to select your own **Development Team** under _Signing & Capabilities_ (the app uses a hardened runtime and is sandboxed with the USB device entitlement).
 
 ## Granting permission (important)
 
@@ -39,7 +39,7 @@ On first launch the app will ask for **Input Monitoring** permission:
 
 > System Settings ▸ Privacy & Security ▸ Input Monitoring
 
-Grant it to SunBeam and **relaunch the app**. This prompt is expected, not a bug — even though SunBeam only opens the mouse's *vendor control* interface, the device advertises keyboard/mouse usage pages, so opening it trips the Input Monitoring gate. Until it's granted, the app can see the mouse but can't send it commands.
+Grant it to SunBeam and **relaunch the app**. This prompt is expected, not a bug — even though SunBeam only opens the mouse's _vendor control_ interface, the device advertises keyboard/mouse usage pages, so opening it trips the Input Monitoring gate. Until it's granted, the app can see the mouse but can't send it commands.
 
 > The permission is tied to the app's identity (`ralexmatthews.SunBeam`), so if the bundle identifier changes you'll be prompted to grant it again.
 
@@ -50,18 +50,25 @@ Grant it to SunBeam and **relaunch the app**. This prompt is expected, not a bug
 3. Press **Apply** to send the settings to the mouse.
 4. Closing the window quits the app.
 
-If the status reads *"No Razer mouse found — plug in the dongle,"* connect the dongle or cable; the app watches for it continuously.
+If the status reads _"No Razer mouse found — plug in the dongle,"_ connect the dongle or cable; the app watches for it continuously.
+
+## Distribution
+
+1. Product → Archive → Distribute App → Custom → Direct Distribution
+2. Xcode signs with Developer ID, uploads for notarization, and waits. When it's done, hit Export — you get a notarized .app
+3. `ditto -c -k --sequesterRsrc --keepParent SunBeam.app SunBeam-X.Y.zip`
+4. `gh release create vX.Y SunBeam-X.Y.zip --title "vX.Y" --notes "some notes"`
 
 ## How it works
 
 The code is organized into four small, independently understandable files:
 
-| File | Responsibility |
-| --- | --- |
-| `RazerProtocol.swift` | Pure data. Builds Razer's fixed 90-byte HID feature-report packet (XOR checksum, transaction id `0x1F`) and the per-effect command arguments. No IOKit. |
+| File                    | Responsibility                                                                                                                                                                                             |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RazerProtocol.swift`   | Pure data. Builds Razer's fixed 90-byte HID feature-report packet (XOR checksum, transaction id `0x1F`) and the per-effect command arguments. No IOKit.                                                    |
 | `RazerController.swift` | All IOKit work — owns the `IOHIDManager`, opens the vendor control interface, tracks wired/wireless links, and serializes reports on a background queue. Exposes a small observable view-model to SwiftUI. |
-| `ContentView.swift` | The UI (effect picker, color picker + hex/RGB field, brightness, Apply) and the color parsing/formatting helpers. |
-| `SunBeamApp.swift` | The `@main` app shell — single content-sized window with a hidden title bar, and quit-on-last-window-closed. |
+| `ContentView.swift`     | The UI (effect picker, color picker + hex/RGB field, brightness, Apply) and the color parsing/formatting helpers.                                                                                          |
+| `SunBeamApp.swift`      | The `@main` app shell — single content-sized window with a hidden title bar, and quit-on-last-window-closed.                                                                                               |
 
 The vendor control interface is identified as the one HID interface whose maximum feature-report size is exactly 90 bytes. Rapid changes (color-wheel drags, slider ticks) are coalesced so only the newest state is sent.
 
