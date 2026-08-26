@@ -68,6 +68,7 @@ struct ContentView: View {
             }
 
             HStack {
+                batteryView
                 Spacer()
                 Button("Apply") { applyCurrent() }
                     .buttonStyle(.borderedProminent)
@@ -92,6 +93,52 @@ struct ContentView: View {
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
+        }
+    }
+
+    /// Battery indicator, shown only once the mouse has actually reported a
+    /// level. Until then this row looks exactly the way it always has.
+    @ViewBuilder
+    private var batteryView: some View {
+        if let percent = controller.batteryPercent {
+            HStack(spacing: 5) {
+                Image(systemName: batterySymbol(percent: percent))
+                    .imageScale(.large)
+                    .foregroundStyle(batteryColor(percent: percent))
+                Text("\(percent)%")
+                    .font(.callout)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .help(controller.isCharging ? "Mouse battery — charging" : "Mouse battery")
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(controller.isCharging
+                                ? "Mouse battery \(percent) percent, charging"
+                                : "Mouse battery \(percent) percent")
+        }
+    }
+
+    /// Only the glyph carries the level color — the percentage next to it stays
+    /// secondary gray. Charging doesn't change the color, so a mouse charging at
+    /// 8% still reads red.
+    private func batteryColor(percent: Int) -> Color {
+        switch percent {
+        case 60...: return .green
+        case 25...: return .yellow
+        default: return .red
+        }
+    }
+
+    /// Charging always gets the bolt glyph — the exact level is in the text
+    /// right beside it, so one charging symbol covers every level.
+    private func batterySymbol(percent: Int) -> String {
+        guard !controller.isCharging else { return "battery.100percent.bolt" }
+        switch percent {
+        case 88...: return "battery.100percent"
+        case 63...: return "battery.75percent"
+        case 38...: return "battery.50percent"
+        case 13...: return "battery.25percent"
+        default: return "battery.0percent"
         }
     }
 

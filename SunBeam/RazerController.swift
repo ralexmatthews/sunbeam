@@ -30,6 +30,9 @@ final class RazerController {
     private(set) var isConnected = false
     private(set) var statusText = "Searching for Basilisk V3 Pro…"
     private(set) var lastError: String?
+    /// Charge level 0...100, or nil until the mouse has answered a battery poll.
+    private(set) var batteryPercent: Int?
+    private(set) var isCharging = false
 
     @ObservationIgnored private let link = RazerDeviceLink()
 
@@ -38,6 +41,8 @@ final class RazerController {
             self?.isConnected = state.connected
             self?.statusText = state.label
             self?.lastError = state.error
+            self?.batteryPercent = state.batteryPercent
+            self?.isCharging = state.isCharging
         }
         link.start()
     }
@@ -57,6 +62,8 @@ nonisolated final class RazerDeviceLink {
         var connected: Bool
         var label: String
         var error: String?
+        var batteryPercent: Int?
+        var isCharging: Bool
     }
 
     /// Invoked on the main queue whenever connection or error state changes.
@@ -75,11 +82,19 @@ nonisolated final class RazerDeviceLink {
     private var draining = false
     private var connected = false
     private var label = "Searching for Basilisk V3 Pro…"
+    private var currentError: String?
+    private var batteryPercent: Int?
+    private var isCharging = false
+    private var batteryTimer: DispatchSourceTimer?
 
     // Razer's config packet is exactly 90 bytes; that maximum feature-report
     // size uniquely identifies the vendor control interface among the several
     // HID interfaces the mouse/dongle exposes.
     private static let controlReportSize = 90
+
+    // Battery moves slowly and every poll is a USB round trip, so once a minute
+    // is plenty; connects and applies trigger an extra read of their own.
+    private static let batteryPollInterval: TimeInterval = 60
 
     private static let matchingCallback: IOHIDDeviceCallback = { context, _, _, device in
         guard let context else { return }
@@ -170,14 +185,20 @@ nonisolated final class RazerDeviceLink {
         // Lower rank wins: wired (0x00AA) over the dongle (0x00AB).
         let chosen = controls.min { rank($0) < rank($1) }
         device = chosen
+        // The mouse's own charging-status command answers unreliably (see
+        // RazerProtocol), so take the wired interface as the truth: it only
+        // appears while the cable is attached, which is exactly when it charges.
+        isCharging = controls.contains { intProperty($0, kIOHIDProductIDKey) == RazerIDs.productWired }
         lock.unlock()
 
         guard let chosen else {
+            stopBatteryPolling()
             setConnection(false, label: "No Razer mouse found — plug in the dongle")
             return
         }
         let connection = intProperty(chosen, kIOHIDProductIDKey) == RazerIDs.productWired ? "wired" : "wireless"
         setConnection(true, label: "Basilisk V3 Pro — connected (\(connection))")
+        startBatteryPolling()
     }
 
     /// Sort key for picking the active interface: wired before wireless.
@@ -226,6 +247,10 @@ nonisolated final class RazerDeviceLink {
                 }
             }
             pushState(error: failure)
+
+            // The mouse is definitely awake right after it accepted a command —
+            // the cheapest moment to get a fresh battery reading.
+            if failure == nil { pollBattery() }
         }
     }
 
@@ -240,9 +265,26 @@ nonisolated final class RazerDeviceLink {
         return reports
     }
 
-    /// Send one report and read the acknowledgement. Returns a user-facing
+    /// The outcome of one request/response exchange with the device.
+    private enum Transaction {
+        /// The write itself failed — a hard, user-visible error.
+        case failed(String)
+        /// The command went through. A reply is attached only when the device
+        /// returned a readable one; some dongle firmware never does.
+        case acknowledged(RazerReport?)
+    }
+
+    /// Send one report, ignoring whatever comes back. Returns a user-facing
     /// error string on hard failure, or nil on success.
     private func send(_ report: RazerReport, to device: IOHIDDevice) -> String? {
+        if case .failed(let error) = transact(report, to: device) { return error }
+        return nil
+    }
+
+    /// Send one report and hand back the device's reply. Callers that need the
+    /// reply must check `answers(_:)` on it — an unreadable or mismatched
+    /// response is not an error for writes, but carries no data for reads.
+    private func transact(_ report: RazerReport, to device: IOHIDDevice) -> Transaction {
         for attempt in 0..<2 {
             let packet = report.packet()
             let setResult = packet.withUnsafeBufferPointer {
@@ -250,7 +292,7 @@ nonisolated final class RazerDeviceLink {
             }
             guard setResult == kIOReturnSuccess else {
                 RazerDeviceLink.log.error("IOHIDDeviceSetReport failed: \(String(format: "0x%08X", UInt32(bitPattern: setResult)), privacy: .public)")
-                return "The mouse didn't accept the command — it may be asleep or disconnected."
+                return .failed("The mouse didn't accept the command — it may be asleep or disconnected.")
             }
 
             // The device needs a beat to process before we read its reply or
@@ -264,16 +306,73 @@ nonisolated final class RazerDeviceLink {
             }
             // Some firmware/dongle combinations don't return a readable feature
             // response; the SetReport already succeeded, so treat that as fine.
-            guard getResult == kIOReturnSuccess else { return nil }
+            guard getResult == kIOReturnSuccess else { return .acknowledged(nil) }
 
             // Status 0x01 means "busy" — wait and retry once.
-            if response[0] == 0x01 && attempt == 0 {
+            if response[0] == RazerReport.statusBusy && attempt == 0 {
                 Thread.sleep(forTimeInterval: 0.05)
                 continue
             }
-            return nil
+            return .acknowledged(RazerReport(packet: Array(response.prefix(min(length, response.count)))))
         }
-        return nil
+        return .acknowledged(nil)
+    }
+
+    // MARK: - Battery
+
+    /// Read the charge level. Always runs on `queue`, so it can never overlap a
+    /// lighting write. A sleeping mouse simply doesn't answer — that is routine,
+    /// so a failed poll keeps the last known reading and never raises a
+    /// user-facing error. Charging state isn't read here; `updateActiveDevice()`
+    /// derives it from which interfaces are present.
+    private func pollBattery() {
+        lock.lock()
+        let device = self.device
+        lock.unlock()
+        guard let device else { return }
+
+        let request = RazerReport.batteryLevel()
+        guard case .acknowledged(let maybeReply) = transact(request, to: device),
+              let reply = maybeReply, reply.answers(request) else {
+            RazerDeviceLink.log.debug("No battery reading — the mouse is probably asleep")
+            return
+        }
+
+        lock.lock()
+        batteryPercent = reply.batteryPercent
+        lock.unlock()
+        publish()
+    }
+
+    /// Begin polling for battery on `queue`, starting with an immediate read.
+    /// Called on every connect; hot-plugging just re-reads through the timer
+    /// that is already running.
+    private func startBatteryPolling() {
+        lock.lock()
+        if batteryTimer != nil {
+            lock.unlock()
+            queue.async { [weak self] in self?.pollBattery() }
+            return
+        }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        batteryTimer = timer
+        lock.unlock()
+
+        timer.schedule(deadline: .now(),
+                       repeating: RazerDeviceLink.batteryPollInterval,
+                       leeway: .seconds(10))
+        timer.setEventHandler { [weak self] in self?.pollBattery() }
+        timer.resume()
+    }
+
+    private func stopBatteryPolling() {
+        lock.lock()
+        let timer = batteryTimer
+        batteryTimer = nil
+        batteryPercent = nil
+        lock.unlock()
+        timer?.cancel()
+        publish()
     }
 
     // MARK: - State plumbing
@@ -288,7 +387,18 @@ nonisolated final class RazerDeviceLink {
 
     private func pushState(error: String?) {
         lock.lock()
-        let state = State(connected: connected, label: label, error: error)
+        currentError = error
+        lock.unlock()
+        publish()
+    }
+
+    /// Re-publish the current state without disturbing the last error. Battery
+    /// polls use this so a routine reading can't wipe an error banner the user
+    /// just got from Apply.
+    private func publish() {
+        lock.lock()
+        let state = State(connected: connected, label: label, error: currentError,
+                          batteryPercent: batteryPercent, isCharging: isCharging)
         lock.unlock()
         DispatchQueue.main.async { [weak self] in self?.stateHandler?(state) }
     }

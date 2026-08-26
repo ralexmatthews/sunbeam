@@ -55,6 +55,12 @@ nonisolated struct RazerReport {
     // Razer's transaction id for the Basilisk V3 Pro family.
     static let transactionID: UInt8 = 0x1F
 
+    // Reply status codes we act on. Razer also defines 0x00 new, 0x03 failure,
+    // 0x04 timeout and 0x05 not-supported; for our purposes all of those mean
+    // "the arguments in this reply are not meaningful".
+    static let statusBusy: UInt8 = 0x01
+    static let statusSuccessful: UInt8 = 0x02
+
     var status: UInt8 = 0x00
     var transaction: UInt8 = RazerReport.transactionID
     var commandClass: UInt8 = 0x00
@@ -128,5 +134,50 @@ nonisolated struct RazerReport {
     /// responding?" probe (class 0x00, command 0x81).
     static func firmwareVersion() -> RazerReport {
         make(class: 0x00, id: 0x81, size: 0x02, [0x00, 0x00])
+    }
+
+    // MARK: - Battery (misc commands, class 0x07)
+
+    /// Ask for the battery charge level (class 0x07, command 0x80). The reply
+    /// carries the raw 0...255 level in `arguments[1]`.
+    static func batteryLevel() -> RazerReport {
+        make(class: 0x07, id: 0x80, size: 0x02, [0x00, 0x00])
+    }
+
+    // There is also a charging-status command (class 0x07, command 0x84), but
+    // on the Basilisk V3 Pro it answers unreliably — the reply flaps regardless
+    // of whether the cable is attached. `RazerDeviceLink` derives charging from
+    // the presence of the wired interface instead; don't reintroduce 0x84.
+}
+
+// MARK: - Reading replies
+
+// Declared in an extension so `RazerReport()` keeps its implicit initializer.
+nonisolated extension RazerReport {
+    /// Parse a 90-byte reply read back from the device — the inverse of
+    /// `packet()`. The checksum is deliberately not verified: some dongle
+    /// firmware leaves it zeroed even on an otherwise good reply.
+    init?(packet bytes: [UInt8]) {
+        guard bytes.count == 90 else { return nil }
+        self.init()
+        status = bytes[0]
+        transaction = bytes[1]
+        dataSize = bytes[5]
+        commandClass = bytes[6]
+        commandID = bytes[7]
+        arguments = Array(bytes[8..<88])
+    }
+
+    /// Whether this reply answers `request` — the control interface is shared,
+    /// so a reply left over from another command can turn up on a read.
+    func answers(_ request: RazerReport) -> Bool {
+        status == RazerReport.statusSuccessful
+            && commandClass == request.commandClass
+            && commandID == request.commandID
+    }
+
+    /// Charge level of a `batteryLevel()` reply, as a 0...100 percentage.
+    var batteryPercent: Int {
+        Int((Double(arguments[1]) / 255 * 100).rounded())
     }
 }
